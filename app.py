@@ -1,61 +1,76 @@
 import os
 import secrets
-import sys
+import urllib.parse
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURATION ---
-# Try to get URL from Render Environment
+# --- CONFIGURATION ---
+
+# 1. Get the raw URL
 DB_URL = os.environ.get("DATABASE_URL")
 
-# ---------------------------------------------------------
-# 🚨 EMERGENCY FIX: If Env Variable fails, paste URL below
-# ---------------------------------------------------------
+# 🚨 EMERGENCY OVERRIDE:
+# If Render fails to read the env var, paste your DIRECT connection string here.
+# NOTE: Use the "Direct Connection" string from Supabase (Port 5432), NOT the Pooler.
 if not DB_URL:
-    # 👇 PASTE YOUR FULL SUPABASE URL INSIDE THE QUOTES BELOW (Use Port 5432!)
-    # Example: "postgresql://postgres.xxx:password@aws-0-eu-central-1.pooler.supabase.com:5432/postgres"
-    DB_URL = "Paste_Your_Supabase_URL_Here" 
+    # Example: "postgresql://postgres.user:password@aws-0-eu-central-1.supabase.com:5432/postgres"
+    DB_URL = "PASTE_YOUR_URL_HERE_IF_NEEDED"
 
-    # If you left it as the placeholder text, reset to None
-    if "Paste_Your_Supabase_URL_Here" in DB_URL:
-        DB_URL = None
-# ---------------------------------------------------------
-
-# --- 2. DATABASE CONNECTION ---
-if not DB_URL:
-    print("❌ CRITICAL ERROR: DATABASE_URL is missing!")
-    print("   -> Go to Render Dashboard > Environment > Add 'DATABASE_URL'")
-    print("   -> Or paste it into the 'EMERGENCY FIX' section in app.py")
-    # Fallback to prevent crash, but data will be lost on restart
-    engine = create_engine("sqlite:///temp.db")
-else:
-    # Fix: SQLAlchemy requires 'postgresql://', not 'postgres://'
-    if DB_URL.startswith("postgres://"):
-        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
-    
-    print("🔄 Attempting to connect to Database...")
-    
+# 2. Fix the URL Connection String
+if DB_URL and "PASTE_YOUR" not in DB_URL:
     try:
-        # Create engine with a ping check to keep connection alive
+        # A. Force PostgreSQL driver
+        if DB_URL.startswith("postgres://"):
+            DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+        # B. URL Encode the Password (The #1 cause of your error)
+        # We parse the URL, encode the password, and rebuild it.
+        # This fixes passwords with @, #, /, : in them.
+        if "@" in DB_URL:
+            prefix = "postgresql://"
+            # Remove prefix
+            clean_url = DB_URL.replace(prefix, "")
+            
+            # Split into credentials and host
+            if "@" in clean_url:
+                creds, host = clean_url.rsplit("@", 1)
+                
+                if ":" in creds:
+                    user, password = creds.split(":", 1)
+                    # Encode the password safely
+                    safe_password = urllib.parse.quote_plus(password)
+                    DB_URL = f"{prefix}{user}:{safe_password}@{host}"
+
+        # C. Force SSL Mode (Required for Supabase)
+        if "?sslmode=" not in DB_URL:
+            if "?" in DB_URL:
+                DB_URL += "&sslmode=require"
+            else:
+                DB_URL += "?sslmode=require"
+        
+        print(f"✅ Connection String Configured (Password Hidden)")
+
+        # Create Engine
         engine = create_engine(DB_URL, pool_pre_ping=True)
         
-        # Test Connection Immediately
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            print("✅ SUCCESS: Connected to Supabase!")
     except Exception as e:
-        print(f"❌ DATABASE CONNECTION FAILED: {e}")
-        print("   -> Check your Password")
-        print("   -> Ensure you are using Port 5432 (Not 6543)")
-        # Fallback
+        print(f"❌ Configuration Error: {e}")
         engine = create_engine("sqlite:///temp.db")
+else:
+    print("⚠️ No DB_URL found. Using local SQLite.")
+    engine = create_engine("sqlite:///temp.db")
 
+
+# --- DATABASE INIT ---
 def init_db():
     try:
         with engine.connect() as conn:
+            conn.execute(text("SELECT 1")) # Test connection
+            print("✅ Database Connected Successfully!")
+            
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS licenses (
                     key_code TEXT PRIMARY KEY,
@@ -71,13 +86,16 @@ def init_db():
             """))
             conn.commit()
     except Exception as e:
-        print(f"⚠️ Init DB Error: {e}")
+        print(f"❌ DATABASE ERROR: {e}")
+        print("💡 HINT: Check your password for typos.")
+        print("💡 HINT: In Supabase, use 'Connection String' -> 'Direct Connection' (Port 5432).")
 
 init_db()
 
+# --- ROUTES ---
 @app.route('/')
 def home():
-    return "License Server is Online."
+    return "License Server Online"
 
 @app.route('/admin')
 def admin_ui():
@@ -91,9 +109,13 @@ def admin_ui():
         <p id="result" style="font-family: monospace; font-size: 20px; font-weight: bold; margin-top: 20px;"></p>
         <script>
             async function generate() {
-                const res = await fetch('/admin/create', { method: 'POST' });
-                const data = await res.json();
-                document.getElementById('result').innerText = data.key || data.error;
+                try {
+                    const res = await fetch('/admin/create', { method: 'POST' });
+                    const data = await res.json();
+                    document.getElementById('result').innerText = data.key || data.error;
+                } catch (e) {
+                    document.getElementById('result').innerText = "Error connecting to server";
+                }
             }
         </script>
     </body>
@@ -122,7 +144,7 @@ def authorize():
 
     try:
         with engine.connect() as conn:
-            # 1. Check active session
+            # 1. Check Session
             session = conn.execute(
                 text("SELECT expires_at FROM active_sessions WHERE user_email = :e"),
                 {"e": email}
@@ -153,13 +175,13 @@ def authorize():
             
             status, duration = row
             if status == 'used':
-                return jsonify({"authorized": False, "error": "Key already used"}), 403
+                return jsonify({"authorized": False, "error": "Key Used"}), 403
 
             # 3. Activate
             new_expiry = datetime.now() + timedelta(hours=duration)
             conn.execute(text("UPDATE licenses SET status = 'used' WHERE key_code = :k"), {"k": provided_key})
             
-            # Upsert Logic
+            # Upsert
             conn.execute(text("DELETE FROM active_sessions WHERE user_email = :e"), {"e": email})
             conn.execute(text("INSERT INTO active_sessions (user_email, expires_at) VALUES (:e, :t)"), {"e": email, "t": new_expiry})
             conn.commit()
@@ -167,8 +189,7 @@ def authorize():
             return jsonify({"authorized": True, "message": "Access Granted"})
 
     except Exception as e:
-        print(f"❌ Runtime DB Error: {e}")
-        return jsonify({"authorized": False, "error": "Server Database Error"}), 500
+        return jsonify({"authorized": False, "error": "DB Connection Failed"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
